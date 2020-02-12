@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	corev1listers "k8s.io/client-go/listers/core/v1"
 	"os"
 	"time"
 
@@ -58,6 +59,7 @@ type backupController struct {
 
 	backupper                pkgbackup.Backupper
 	lister                   listers.BackupLister
+	secretLister           	 corev1listers.SecretLister
 	client                   velerov1client.BackupsGetter
 	clock                    clock.Clock
 	backupLogLevel           logrus.Level
@@ -254,6 +256,10 @@ func (c *backupController) processBackup(key string) error {
 	backupScheduleName := request.GetLabels()[velerov1api.ScheduleNameLabel]
 	c.metrics.RegisterBackupAttempt(backupScheduleName)
 
+	if request.Spec.RemoteClusterSecretRef != nil {
+		log.Info("Found remote cluster reference")
+
+	}
 	// execution & upload of backup
 	if err := c.runBackup(request); err != nil {
 		// even though runBackup sets the backup's phase prior

@@ -21,6 +21,7 @@ limitations under the License.
 package v1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
 )
@@ -229,6 +230,11 @@ func (in *BackupSpec) DeepCopyInto(out *BackupSpec) {
 		in, out := &in.VolumeSnapshotLocations, &out.VolumeSnapshotLocations
 		*out = make([]string, len(*in))
 		copy(*out, *in)
+	}
+	if in.RemoteClusterSecretRef != nil {
+		in, out := &in.RemoteClusterSecretRef, &out.RemoteClusterSecretRef
+		*out = new(corev1.ObjectReference)
+		**out = **in
 	}
 	return
 }

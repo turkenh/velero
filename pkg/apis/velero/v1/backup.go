@@ -17,6 +17,7 @@ limitations under the License.
 package v1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -82,6 +83,10 @@ type BackupSpec struct {
 	// VolumeSnapshotLocations is a list containing names of VolumeSnapshotLocations associated with this backup.
 	// +optional
 	VolumeSnapshotLocations []string `json:"volumeSnapshotLocations,omitempty"`
+
+	// RemoteClusterSecretRef is a reference to Kubernetes Secret holding kubeconfig file of remote cluster to backup for key "kubeconfig"
+	// +optional
+	RemoteClusterSecretRef *corev1.ObjectReference `json:"remoteClusterSecretRef,omitempty"`
 }
 
 // BackupHooks contains custom behaviors that should be executed at different phases of the backup.
