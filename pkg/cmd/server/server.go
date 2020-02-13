@@ -44,7 +44,6 @@ import (
 	"k8s.io/client-go/tools/cache"
 
 	api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
-	"github.com/vmware-tanzu/velero/pkg/backup"
 	"github.com/vmware-tanzu/velero/pkg/buildinfo"
 	"github.com/vmware-tanzu/velero/pkg/client"
 	"github.com/vmware-tanzu/velero/pkg/cmd"
@@ -58,7 +57,6 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/metrics"
 	"github.com/vmware-tanzu/velero/pkg/persistence"
 	"github.com/vmware-tanzu/velero/pkg/plugin/clientmgmt"
-	"github.com/vmware-tanzu/velero/pkg/podexec"
 	"github.com/vmware-tanzu/velero/pkg/restic"
 	"github.com/vmware-tanzu/velero/pkg/restore"
 	"github.com/vmware-tanzu/velero/pkg/util/logging"
@@ -568,33 +566,32 @@ func (s *server) runControllers(defaultVolumeSnapshotLocations map[string]string
 
 	backupTracker := controller.NewBackupTracker()
 
+	backupController, err := controller.NewBackupController(
+		s.sharedInformerFactory.Velero().V1().Backups(),
+		s.veleroClient.VeleroV1(),
+		s.logger,
+		s.logLevel,
+		newPluginManager,
+		backupTracker,
+		s.sharedInformerFactory.Velero().V1().BackupStorageLocations(),
+		s.config.defaultBackupLocation,
+		s.config.defaultBackupTTL,
+		s.sharedInformerFactory.Velero().V1().VolumeSnapshotLocations(),
+		defaultVolumeSnapshotLocations,
+		s.metrics,
+		s.config.formatFlag.Parse(),
+
+		s.discoveryHelper,
+		s.dynamicClient,
+		s.kubeClientConfig,
+		s.kubeClient,
+		s.resticManager,
+		s.config.podVolumeOperationTimeout,
+	)
+
+	cmd.CheckError(err)
+
 	backupControllerRunInfo := func() controllerRunInfo {
-		backupper, err := backup.NewKubernetesBackupper(
-			s.discoveryHelper,
-			client.NewDynamicFactory(s.dynamicClient),
-			podexec.NewPodCommandExecutor(s.kubeClientConfig, s.kubeClient.CoreV1().RESTClient()),
-			s.resticManager,
-			s.config.podVolumeOperationTimeout,
-		)
-		cmd.CheckError(err)
-
-		backupController := controller.NewBackupController(
-			s.sharedInformerFactory.Velero().V1().Backups(),
-			s.veleroClient.VeleroV1(),
-			backupper,
-			s.logger,
-			s.logLevel,
-			newPluginManager,
-			backupTracker,
-			s.sharedInformerFactory.Velero().V1().BackupStorageLocations(),
-			s.config.defaultBackupLocation,
-			s.config.defaultBackupTTL,
-			s.sharedInformerFactory.Velero().V1().VolumeSnapshotLocations(),
-			defaultVolumeSnapshotLocations,
-			s.metrics,
-			s.config.formatFlag.Parse(),
-		)
-
 		return controllerRunInfo{
 			controller: backupController,
 			numWorkers: defaultControllerWorkers,

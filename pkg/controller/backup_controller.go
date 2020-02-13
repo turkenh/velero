@@ -21,9 +21,18 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
+	"github.com/spf13/pflag"
+	"github.com/vmware-tanzu/velero/pkg/discovery"
+	"github.com/vmware-tanzu/velero/pkg/podexec"
+	"github.com/vmware-tanzu/velero/pkg/restic"
 	"io"
 	"io/ioutil"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 	corev1listers "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/rest"
 	"os"
 	"time"
 
@@ -40,6 +49,7 @@ import (
 
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	pkgbackup "github.com/vmware-tanzu/velero/pkg/backup"
+	pkgclient "github.com/vmware-tanzu/velero/pkg/client"
 	velerov1client "github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned/typed/velero/v1"
 	informers "github.com/vmware-tanzu/velero/pkg/generated/informers/externalversions/velero/v1"
 	listers "github.com/vmware-tanzu/velero/pkg/generated/listers/velero/v1"
@@ -59,7 +69,7 @@ type backupController struct {
 
 	backupper                pkgbackup.Backupper
 	lister                   listers.BackupLister
-	secretLister           	 corev1listers.SecretLister
+	secretLister             corev1listers.SecretLister
 	client                   velerov1client.BackupsGetter
 	clock                    clock.Clock
 	backupLogLevel           logrus.Level
@@ -73,12 +83,18 @@ type backupController struct {
 	metrics                  *metrics.ServerMetrics
 	newBackupStore           func(*velerov1api.BackupStorageLocation, persistence.ObjectStoreGetter, logrus.FieldLogger) (persistence.BackupStore, error)
 	formatFlag               logging.Format
+
+	discoveryHelper        discovery.Helper
+	dynamicClient          dynamic.Interface
+	kubeClientConfig       *rest.Config
+	kubeClient             kubernetes.Interface
+	resticBackupperFactory restic.BackupperFactory
+	resticTimeout          time.Duration
 }
 
 func NewBackupController(
 	backupInformer informers.BackupInformer,
 	client velerov1client.BackupsGetter,
-	backupper pkgbackup.Backupper,
 	logger logrus.FieldLogger,
 	backupLogLevel logrus.Level,
 	newPluginManager func(logrus.FieldLogger) clientmgmt.Manager,
@@ -90,10 +106,16 @@ func NewBackupController(
 	defaultSnapshotLocations map[string]string,
 	metrics *metrics.ServerMetrics,
 	formatFlag logging.Format,
-) Interface {
+
+	discoveryHelper discovery.Helper,
+	dynamicClient dynamic.Interface,
+	kubeClientConfig *rest.Config,
+	kubeClient kubernetes.Interface,
+	resticBackupperFactory restic.BackupperFactory,
+	resticTimeout time.Duration,
+) (Interface, error) {
 	c := &backupController{
 		genericController:        newGenericController("backup", logger),
-		backupper:                backupper,
 		lister:                   backupInformer.Lister(),
 		client:                   client,
 		clock:                    &clock.RealClock{},
@@ -108,6 +130,13 @@ func NewBackupController(
 		metrics:                  metrics,
 		formatFlag:               formatFlag,
 
+		discoveryHelper:        discoveryHelper,
+		dynamicClient:          dynamicClient,
+		kubeClientConfig:       kubeClientConfig,
+		kubeClient:             kubeClient,
+		resticBackupperFactory: resticBackupperFactory,
+		resticTimeout:          resticTimeout,
+
 		newBackupStore: persistence.NewObjectBackupStore,
 	}
 
@@ -119,6 +148,21 @@ func NewBackupController(
 	)
 	c.resyncFunc = c.resync
 	c.resyncPeriod = time.Minute
+
+	// Initialize default KubernetesBackupper
+	backupper, err := pkgbackup.NewKubernetesBackupper(
+		c.discoveryHelper,
+		pkgclient.NewDynamicFactory(c.dynamicClient),
+		podexec.NewPodCommandExecutor(c.kubeClientConfig, c.kubeClient.CoreV1().RESTClient()),
+		c.resticBackupperFactory,
+		c.resticTimeout,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	c.backupper = backupper
 
 	backupInformer.Informer().AddEventHandler(
 		cache.ResourceEventHandlerFuncs{
@@ -146,7 +190,7 @@ func NewBackupController(
 		},
 	)
 
-	return c
+	return c, nil
 }
 
 func (c *backupController) resync() {
@@ -256,10 +300,6 @@ func (c *backupController) processBackup(key string) error {
 	backupScheduleName := request.GetLabels()[velerov1api.ScheduleNameLabel]
 	c.metrics.RegisterBackupAttempt(backupScheduleName)
 
-	if request.Spec.RemoteClusterSecretRef != nil {
-		log.Info("Found remote cluster reference")
-
-	}
 	// execution & upload of backup
 	if err := c.runBackup(request); err != nil {
 		// even though runBackup sets the backup's phase prior
@@ -530,8 +570,74 @@ func (c *backupController) runBackup(backup *pkgbackup.Request) error {
 		return errors.Errorf("backup already exists in object storage")
 	}
 
+	// HT WIP
+	backupper := c.backupper
+	if backup.Spec.RemoteClusterSecretRef != nil {
+		backupLog.Info("Found remote cluster reference")
+
+		f, err := tempCredentialsFile(c.kubeClient, backup.Spec.RemoteClusterSecretRef)
+		if err != nil {
+			return err
+		}
+		defer os.Remove(f)
+
+		rf := pkgclient.NewFactory("velero", make(map[string]interface{}))
+		tmpflags := new(pflag.FlagSet)
+		rf.BindFlags(tmpflags)
+		tmpflags.Parse([]string{"--kubeconfig", f})
+
+		rClient, err := rf.Client()
+		if err != nil {
+			return err
+		}
+
+		// init discovery helper
+		rDiscoveryHelper, err := discovery.NewHelper(rClient.Discovery(), backupLog)
+		if err != nil {
+			return err
+		}
+		go wait.Until(
+			func() {
+				if err := rDiscoveryHelper.Refresh(); err != nil {
+					backupLog.WithError(err).Error("Error refreshing discovery")
+				}
+			},
+			5*time.Minute,
+			nil,
+		)
+		///
+
+		rDynamicClient, err := rf.DynamicClient()
+		if err != nil {
+			return err
+		}
+
+		rKubeClientConfig, err := rf.ClientConfig()
+		if err != nil {
+			return err
+		}
+		rKubeClient, err := rf.KubeClient()
+		if err != nil {
+			return err
+		}
+		// Initialize default KubernetesBackupper
+		remoteBackupper, err := pkgbackup.NewKubernetesBackupper(
+			rDiscoveryHelper,
+			pkgclient.NewDynamicFactory(rDynamicClient),
+			podexec.NewPodCommandExecutor(rKubeClientConfig, rKubeClient.CoreV1().RESTClient()),
+			nil,
+			-1,
+		)
+
+		if err != nil {
+			return err
+		}
+
+		backupper = remoteBackupper
+	}
+
 	var fatalErrs []error
-	if err := c.backupper.Backup(backupLog, backup, backupFile, actions, pluginManager); err != nil {
+	if err := backupper.Backup(backupLog, backup, backupFile, actions, pluginManager); err != nil {
 		fatalErrs = append(fatalErrs, err)
 	}
 
@@ -667,4 +773,36 @@ func closeAndRemoveFile(file *os.File, log logrus.FieldLogger) {
 	if err := os.Remove(file.Name()); err != nil {
 		log.WithError(err).WithField("file", file.Name()).Error("error removing file")
 	}
+}
+
+func tempCredentialsFile(kubeClient kubernetes.Interface,secretRef *corev1.ObjectReference) (string, error) {
+	s, err := kubeClient.CoreV1().Secrets(secretRef.Namespace).Get(secretRef.Name, metav1.GetOptions{})
+	if err != nil {
+		return "", nil
+	}
+
+	confBytes, ok := s.Data["kubeconfig"]
+	if !ok {
+		return "", errors.New("could not find key \"kubeconfig\" in remote cluster secret")
+	}
+
+	file, err := ioutil.TempFile("", fmt.Sprintf("%s-%s", secretRef.Namespace, secretRef.Name))
+	if err != nil {
+		return "", errors.WithStack(err)
+	}
+
+	if _, err := file.Write(confBytes); err != nil {
+		// nothing we can do about an error closing the file here, and we're
+		// already returning an error about the write failing.
+		file.Close()
+		return "", errors.WithStack(err)
+	}
+
+	name := file.Name()
+
+	if err := file.Close(); err != nil {
+		return "", errors.WithStack(err)
+	}
+
+	return name, nil
 }
